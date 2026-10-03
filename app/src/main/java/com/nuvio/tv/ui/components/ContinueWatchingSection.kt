@@ -349,63 +349,64 @@ internal fun continueWatchingUsesEpisodeThumbnails(
     useEpisodeThumbnails: Boolean
 ): Boolean = useEpisodeThumbnails && cardStyle != ContinueWatchingCardStyle.POSTER
 
-// Selects the primary Continue Watching image URL, shared by the card and the home-row prefetch so both request the same model.
-internal fun continueWatchingImageModel(
+// Returns every usable Continue Watching / Upcoming artwork candidate in priority order.
+// The card advances through this list on image failures instead of stopping after a single fallback.
+internal fun continueWatchingImageCandidates(
     item: ContinueWatchingItem,
     useEpisodeThumbnails: Boolean,
     preferPosterArtwork: Boolean = false
-): String? {
+): List<String> {
     val customLandscape = when (item) {
         is ContinueWatchingItem.InProgress -> item.customLandscapePoster
         is ContinueWatchingItem.NextUp -> item.customLandscapePoster
     }
-    // Poster art is already 2:3 so it wins here, and only an opted-in episode thumbnail outranks it.
-    if (preferPosterArtwork) {
-        val posterProgress = (item as? ContinueWatchingItem.InProgress)?.progress
-        val posterNextUp = (item as? ContinueWatchingItem.NextUp)?.info
-        val poster = posterNextUp?.poster ?: posterProgress?.poster
-        val backdrop = posterNextUp?.backdrop ?: posterProgress?.backdrop
-        val thumbnail = posterNextUp?.thumbnail
-            ?: (item as? ContinueWatchingItem.InProgress)?.episodeThumbnail
-        fun firstUsable(vararg candidates: String?): String? =
-            candidates.firstOrNull { !it.isNullOrBlank() && it !in brokenImageUrls }?.trim()
-        // Movies carry no episode thumbnail, so they keep their poster without needing a content type check.
-        // A thumbnail that is switched off leaves the chain entirely, because Trakt rows hydrate their artwork late and a demoted thumbnail would show until it lands.
-        return if (useEpisodeThumbnails) {
-            firstUsable(thumbnail, poster, backdrop)
-        } else {
-            firstUsable(poster, backdrop)
-        }
+    val originalPoster = when (item) {
+        is ContinueWatchingItem.InProgress -> item.originalPoster
+        is ContinueWatchingItem.NextUp -> item.originalPoster
     }
     val progress = (item as? ContinueWatchingItem.InProgress)?.progress
     val nextUp = (item as? ContinueWatchingItem.NextUp)?.info
-    fun firstNonBroken(vararg candidates: String?): String? =
-        candidates.firstOrNull { !it.isNullOrBlank() && it !in brokenImageUrls }?.trim()
-    return when {
+    val thumbnail = nextUp?.thumbnail
+        ?: (item as? ContinueWatchingItem.InProgress)?.episodeThumbnail
+    val poster = nextUp?.poster ?: progress?.poster
+    val backdrop = nextUp?.backdrop ?: progress?.backdrop
+
+    val candidates = when {
+        // Poster and wide cards prefer portrait artwork, but still recover through every available source.
+        preferPosterArtwork && useEpisodeThumbnails ->
+            listOf(thumbnail, poster, customLandscape, backdrop, originalPoster)
+        preferPosterArtwork ->
+            listOf(poster, customLandscape, backdrop, originalPoster)
+
+        // Upcoming episodes often have no still yet, so prefer show-level landscape art before the thumbnail.
         nextUp != null && !nextUp.hasAired ->
-            firstNonBroken(
-                customLandscape,
-                nextUp.backdrop,
-                nextUp.poster,
-                nextUp.thumbnail.takeIf { useEpisodeThumbnails }
-            )
+            listOf(customLandscape, backdrop, poster, thumbnail.takeIf { useEpisodeThumbnails }, originalPoster)
         nextUp != null && useEpisodeThumbnails ->
-            firstNonBroken(nextUp.thumbnail, customLandscape, nextUp.backdrop, nextUp.poster)
+            listOf(thumbnail, customLandscape, backdrop, poster, originalPoster)
         nextUp != null ->
-            firstNonBroken(customLandscape, nextUp.backdrop, nextUp.poster)
-        useEpisodeThumbnails -> firstNonBroken(
-            (item as? ContinueWatchingItem.InProgress)?.episodeThumbnail,
-            customLandscape,
-            progress?.backdrop,
-            progress?.poster
-        )
-        else -> firstNonBroken(
-            customLandscape,
-            progress?.backdrop,
-            progress?.poster
-        )
+            listOf(customLandscape, backdrop, poster, originalPoster)
+        useEpisodeThumbnails ->
+            listOf(thumbnail, customLandscape, backdrop, poster, originalPoster)
+        else ->
+            listOf(customLandscape, backdrop, poster, originalPoster)
     }
+
+    return candidates
+        .mapNotNull { it?.trim()?.takeIf(String::isNotEmpty) }
+        .distinct()
+        .filterNot { it in brokenImageUrls }
 }
+
+// Selects the first currently usable image URL. Home-row prefetch continues to use the same primary candidate.
+internal fun continueWatchingImageModel(
+    item: ContinueWatchingItem,
+    useEpisodeThumbnails: Boolean,
+    preferPosterArtwork: Boolean = false
+): String? = continueWatchingImageCandidates(
+    item = item,
+    useEpisodeThumbnails = useEpisodeThumbnails,
+    preferPosterArtwork = preferPosterArtwork
+).firstOrNull()
 
 // Whether the unwatched-episode spoiler blur applies to this item.
 internal fun continueWatchingShouldBlur(
@@ -525,23 +526,23 @@ fun ContinueWatchingCard(
         remainingText ?: nextUpBadgeText ?: effectiveNextUpLabel
     }
     val progressFraction = remember(progress) { progress?.progressPercentage ?: 0f }
-    val imageModel = remember(item, effectiveEpisodeThumbnails, usePosterArtwork) {
-        continueWatchingImageModel(item, effectiveEpisodeThumbnails, usePosterArtwork)
+    val imageCandidates = remember(item, effectiveEpisodeThumbnails, usePosterArtwork) {
+        continueWatchingImageCandidates(item, effectiveEpisodeThumbnails, usePosterArtwork)
     }
-    // A poster card keeps poster art first when falling back, so a load failure does not drop it to a cropped backdrop.
-    val fallbackImageModel = remember(nextUp, progress, item, usePosterArtwork) {
-        when {
-            usePosterArtwork && nextUp != null -> firstNonBlank(nextUp.poster, nextUp.backdrop)
-            usePosterArtwork -> firstNonBlank(progress?.poster, progress?.backdrop)
-            nextUp != null -> firstNonBlank(nextUp.backdrop, nextUp.poster)
-            else -> firstNonBlank(progress?.backdrop, progress?.poster)
+    var imageCandidateIndex by remember(item, effectiveEpisodeThumbnails, usePosterArtwork) {
+        mutableIntStateOf(0)
+    }
+    LaunchedEffect(imageCandidates) {
+        imageCandidateIndex = 0
+    }
+    val effectiveImageModel = imageCandidates.getOrNull(imageCandidateIndex)
+    val advanceImageCandidate: () -> Unit = {
+        effectiveImageModel?.let(brokenImageUrls::add)
+        if (imageCandidateIndex < imageCandidates.lastIndex) {
+            imageCandidateIndex += 1
         }
     }
-    var usesFallbackImage by remember { mutableStateOf(false) }
-    // Reset fallback state when the item changes
-    LaunchedEffect(imageModel) { usesFallbackImage = false }
 
-    val effectiveImageModel = if (usesFallbackImage) fallbackImageModel else imageModel
     val titleText = remember(progress, nextUp) { progress?.name ?: nextUp?.name.orEmpty() }
     val context = LocalContext.current
     val strAirsDateForEpisode = computeAirDateBadgeText(context, nextUp?.released, nextUp?.airDateLabel)
@@ -560,8 +561,13 @@ fun ContinueWatchingCard(
     val requestHeightPx = remember(imageHeight, density) {
         with(density) { imageHeight.roundToPx() }.coerceAtLeast(1)
     }
+    val episodeThumbnailUrl = when (item) {
+        is ContinueWatchingItem.InProgress -> item.episodeThumbnail
+        is ContinueWatchingItem.NextUp -> item.info.thumbnail
+    }?.trim()
     val shouldBlur =
-        continueWatchingShouldBlur(item, blurUnwatchedEpisodes, effectiveEpisodeThumbnails, usePosterArtwork)
+        continueWatchingShouldBlur(item, blurUnwatchedEpisodes, effectiveEpisodeThumbnails, usePosterArtwork) &&
+            effectiveImageModel?.trim() == episodeThumbnailUrl
 
     val baseTitleStyle = MaterialTheme.typography.titleSmall
     val titleStyle = remember(baseTitleStyle, isPosterStyle, posterTitleOverride) {
@@ -700,14 +706,7 @@ fun ContinueWatchingCard(
                 shufflePlayback = item.shufflePlayback,
                 progressFraction = progressFraction,
                 hasProgress = progress != null,
-                onImageError = {
-                    if (!usesFallbackImage && effectiveImageModel != null) {
-                        brokenImageUrls.add(effectiveImageModel)
-                        if (fallbackImageModel != null && fallbackImageModel != effectiveImageModel) {
-                            usesFallbackImage = true
-                        }
-                    }
-                }
+                onImageError = advanceImageCandidate
             )
             return@Card
         }
@@ -791,15 +790,7 @@ fun ContinueWatchingCard(
                         error = backgroundPainter,
                         fallback = backgroundPainter,
                         contentScale = ContentScale.Crop,
-                        onError = {
-                            // Primary image failed (e.g. broken thumbnail URL) — remember and try fallback.
-                            if (!usesFallbackImage && effectiveImageModel != null) {
-                                brokenImageUrls.add(effectiveImageModel)
-                                if (fallbackImageModel != null && fallbackImageModel != effectiveImageModel) {
-                                    usesFallbackImage = true
-                                }
-                            }
-                        }
+                        onError = { advanceImageCandidate() }
                     )
                 }
 
